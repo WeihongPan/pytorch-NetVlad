@@ -19,6 +19,7 @@ import torchvision.datasets as datasets
 import torchvision.models as models
 import h5py
 import faiss
+from tqdm import tqdm
 
 from tensorboardX import SummaryWriter
 import numpy as np
@@ -44,11 +45,11 @@ parser.add_argument('--momentum', type=float, default=0.9, help='Momentum for SG
 parser.add_argument('--nocuda', action='store_true', help='Dont use cuda')
 parser.add_argument('--threads', type=int, default=8, help='Number of threads for each data loader to use')
 parser.add_argument('--seed', type=int, default=123, help='Random seed to use.')
-parser.add_argument('--dataPath', type=str, default='/nfs/ibrahimi/data/', help='Path for centroid data.')
-parser.add_argument('--runsPath', type=str, default='/nfs/ibrahimi/runs/', help='Path to save runs to.')
+parser.add_argument('--dataPath', type=str, default='../data/', help='Path for centroid data.')
+parser.add_argument('--runsPath', type=str, default='./runs/', help='Path to save runs to.')
 parser.add_argument('--savePath', type=str, default='checkpoints', 
         help='Path to save checkpoints to in logdir. Default=checkpoints/')
-parser.add_argument('--cachePath', type=str, default=environ['TMPDIR'], help='Path to save cache to.')
+parser.add_argument('--cachePath', type=str, default='./cache', help='Path to save cache to.')
 parser.add_argument('--resume', type=str, default='', help='Path to load checkpoint from, for resuming training or testing.')
 parser.add_argument('--ckpt', type=str, default='latest', 
         help='Resume from latest or best checkpoint.', choices=['latest', 'best'])
@@ -86,20 +87,23 @@ def train(epoch):
         print('====> Building Cache')
         model.eval()
         train_set.cache = join(opt.cachePath, train_set.whichSet + '_feat_cache.hdf5')
+        print("train set cache: ", train_set.cache)
         with h5py.File(train_set.cache, mode='w') as h5: 
             pool_size = encoder_dim
             if opt.pooling.lower() == 'netvlad': pool_size *= opt.num_clusters
             h5feat = h5.create_dataset("features", 
                     [len(whole_train_set), pool_size], 
                     dtype=np.float32)
+            #whole_training_data_loader = whole_training_data_loader[:10] # for debug
             with torch.no_grad():
-                for iteration, (input, indices) in enumerate(whole_training_data_loader, 1):
+                for iteration, (input, indices) in tqdm(enumerate(whole_training_data_loader, 1), total=len(whole_training_data_loader)):
                     input = input.to(device)
+                    # print('shape of input: ', input.shape)
                     image_encoding = model.encoder(input)
                     vlad_encoding = model.pool(image_encoding) 
                     h5feat[indices.detach().numpy(), :] = vlad_encoding.detach().cpu().numpy()
                     del input, image_encoding, vlad_encoding
-
+        print('h5 file loaded')
         sub_train_set = Subset(dataset=train_set, indices=subsetIdx[subIter])
 
         training_data_loader = DataLoader(dataset=sub_train_set, num_workers=opt.threads, 
@@ -117,6 +121,7 @@ def train(epoch):
             if query is None: continue # in case we get an empty batch
 
             B, C, H, W = query.shape
+            # print('shape of query: ', query.shape)
             nNeg = torch.sum(negCounts)
             input = torch.cat([query, positives, negatives])
 
@@ -507,9 +512,11 @@ if __name__ == "__main__":
         not_improved = 0
         best_score = 0
         for epoch in range(opt.start_epoch+1, opt.nEpochs + 1):
-            if opt.optim.upper() == 'SGD':
-                scheduler.step(epoch)
+            # if opt.optim.upper() == 'SGD':
+            #     scheduler.step(epoch)
+            # train(epoch)
             train(epoch)
+            
             if (epoch % opt.evalEvery) == 0:
                 recalls = test(whole_test_set, epoch, write_tboard=True)
                 is_best = recalls[5] > best_score 
@@ -531,6 +538,7 @@ if __name__ == "__main__":
                 if opt.patience > 0 and not_improved > (opt.patience / opt.evalEvery):
                     print('Performance did not improve for', opt.patience, 'epochs. Stopping.')
                     break
-
+            if opt.optim.upper() == 'SGD':
+                scheduler.step(epoch)
         print("=> Best Recall@5: {:.4f}".format(best_score), flush=True)
         writer.close()

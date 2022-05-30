@@ -45,6 +45,7 @@ parser.add_argument('--momentum', type=float, default=0.9, help='Momentum for SG
 parser.add_argument('--nocuda', action='store_true', help='Dont use cuda')
 parser.add_argument('--threads', type=int, default=8, help='Number of threads for each data loader to use')
 parser.add_argument('--seed', type=int, default=123, help='Random seed to use.')
+parser.add_argument('--save', action='store_true', help='save or not')
 parser.add_argument('--dataPath', type=str, default='../data/', help='Path for centroid data.')
 parser.add_argument('--runsPath', type=str, default='./runs/', help='Path to save runs to.')
 parser.add_argument('--savePath', type=str, default='checkpoints', 
@@ -495,7 +496,8 @@ if __name__ == "__main__":
         get_clusters(whole_train_set)
     elif opt.mode.lower() == 'train':
         print('===> Training model')
-        writer = SummaryWriter(log_dir=join(opt.runsPath, datetime.now().strftime('%b%d_%H-%M-%S')+'_'+opt.arch+'_'+opt.pooling))
+        if opt.save:
+            writer = SummaryWriter(log_dir=join(opt.runsPath, datetime.now().strftime('%b%d_%H-%M-%S')+'_'+opt.arch+'_'+opt.pooling))
 
         # write checkpoints in logdir
         logdir = writer.file_writer.get_logdir()
@@ -525,15 +527,16 @@ if __name__ == "__main__":
                     best_score = recalls[5]
                 else: 
                     not_improved += 1
-
-                save_checkpoint({
-                        'epoch': epoch,
-                        'state_dict': model.state_dict(),
-                        'recalls': recalls,
-                        'best_score': best_score,
-                        'optimizer' : optimizer.state_dict(),
-                        'parallel' : isParallel,
-                }, is_best)
+                
+                if opt.save:
+                    save_checkpoint({
+                            'epoch': epoch,
+                            'state_dict': model.state_dict(),
+                            'recalls': recalls,
+                            'best_score': best_score,
+                            'optimizer' : optimizer.state_dict(),
+                            'parallel' : isParallel,
+                    }, is_best)
 
                 if opt.patience > 0 and not_improved > (opt.patience / opt.evalEvery):
                     print('Performance did not improve for', opt.patience, 'epochs. Stopping.')

@@ -1,4 +1,10 @@
 from __future__ import print_function
+import os
+os.environ["OMP_NUM_THREADS"] = "1" # noqa
+os.environ["MKL_NUM_THREADS"] = "1" # noqa
+os.environ["CUDA_VISIBLE_DEVICES"] = "3,5"
+
+
 import argparse
 from math import log10, ceil
 import random, shutil, json
@@ -20,6 +26,8 @@ import torchvision.models as models
 import h5py
 import faiss
 from tqdm import tqdm
+
+from spikingjelly.clock_driven import functional
 
 from tensorboardX import SummaryWriter
 import numpy as np
@@ -104,6 +112,7 @@ def train(epoch):
                     vlad_encoding = model.pool(image_encoding) 
                     h5feat[indices.detach().numpy(), :] = vlad_encoding.detach().cpu().numpy()
                     del input, image_encoding, vlad_encoding
+                    functional.reset_net(model)
         print('h5 file loaded')
         sub_train_set = Subset(dataset=train_set, indices=subsetIdx[subIter])
 
@@ -116,21 +125,33 @@ def train(epoch):
 
         model.train()
         for iteration, (query, positives, negatives, 
-                negCounts, indices) in enumerate(training_data_loader, startIter):
+                negCounts, indices) in tqdm(enumerate(training_data_loader, startIter), total=len(training_data_loader)):
             # some reshaping to put query, pos, negs in a single (N, 3, H, W) tensor
             # where N = batchSize * (nQuery + nPos + nNeg)
             if query is None: continue # in case we get an empty batch
 
             B, C, H, W = query.shape
+            # print('=====> iteration', str(iteration))
             # print('shape of query: ', query.shape)
+            # print('shape of positives: ', positives.shape)
+            # print('shape of negatives: ', negatives.shape)
             nNeg = torch.sum(negCounts)
             input = torch.cat([query, positives, negatives])
+            # print('nNeg: ', nNeg)
+            # print('negCounts: ', negCounts)
 
-            input = input.to(device)
+            input = input.to(device)            
             image_encoding = model.encoder(input)
-            vlad_encoding = model.pool(image_encoding) 
+            vlad_encoding = model.pool(image_encoding) #24,64,512
 
-            vladQ, vladP, vladN = torch.split(vlad_encoding, [B, B, nNeg])
+            vladQ, vladP, vladN = torch.split(vlad_encoding, [B, B, nNeg]) #2 2 20
+            # if iteration <= 5:
+            #     if torch.sum(input): 
+            #         print('input tensor:', input) 
+            #         print('vgg encoding:', image_encoding)
+            #         print('vlad encoding: ', vlad_encoding)
+            #     else: 
+            #         print('input tensor is zero')                            
 
             optimizer.zero_grad()
             
@@ -141,13 +162,33 @@ def train(epoch):
             for i, negCount in enumerate(negCounts):
                 for n in range(negCount):
                     negIx = (torch.sum(negCounts[:i]) + n).item()
-                    loss += criterion(vladQ[i:i+1], vladP[i:i+1], vladN[negIx:negIx+1])
 
+                    # print('===>Query',i,', Neg', n)
+                    # d_pos = torch.sum(torch.square(vladQ[i:i+1] - vladP[i:i+1]), 1)
+                    # d_neg = torch.sum(torch.square(vladQ[i:i+1] - vladN[negIx:negIx+1]), 1)
+                    # loss_i = torch.maximum(torch.tensor(0.0), opt.margin**0.5 + d_pos - d_neg)                                        
+                    # print('d_pos: ', d_pos)
+                    # print('d_neg: ', d_neg)
+                    # print('loss_i: ', loss_i)
+                    # print('triplet loss: ', criterion(vladQ[i:i+1], vladP[i:i+1], vladN[negIx:negIx+1]))
+
+                    loss += criterion(vladQ[i:i+1], vladP[i:i+1], vladN[negIx:negIx+1])
+            # print('loss: ', loss)
             loss /= nNeg.float().to(device) # normalise by actual number of negatives
+            # print('loss after normalization: ', loss)
+
             loss.backward()
             optimizer.step()
+
+            # debug
+            # if iteration <= 5:
+            #     print('==> vgg state')
+            #     for name, param in model.encoder.named_parameters():
+            #         if param.requires_grad:
+            #             print('name:', name, '\tgrad:',param.grad)
+
             del input, image_encoding, vlad_encoding, vladQ, vladP, vladN
-            del query, positives, negatives
+            del query, positives, negatives            
 
             batch_loss = loss.item()
             epoch_loss += batch_loss
@@ -161,6 +202,7 @@ def train(epoch):
                         ((epoch-1) * nBatches) + iteration)
                 print('Allocated:', torch.cuda.memory_allocated())
                 print('Cached:', torch.cuda.memory_cached())
+            functional.reset_net(model)
 
         startIter += len(training_data_loader)
         del training_data_loader, loss
@@ -198,6 +240,7 @@ def test(eval_set, epoch=0, write_tboard=False):
                     len(test_data_loader)), flush=True)
 
             del input, image_encoding, vlad_encoding
+            functional.reset_net(model)
     del test_data_loader
 
     # extracted for both db and query, now split in own sets
@@ -288,6 +331,14 @@ def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
     if is_best:
         shutil.copyfile(model_out_path, join(opt.savePath, 'model_best.pth.tar'))
 
+def reset_model(model: nn.Module):
+    # find modules with reset() function
+    reset_modules = []
+    for m in model.modules:
+        if hasattr(m, 'reset'):
+            print(m)
+            reset_modules.append(m)
+
 class Flatten(nn.Module):
     def forward(self, input):
         return input.view(input.size(0), -1)
@@ -299,6 +350,7 @@ class L2Norm(nn.Module):
 
     def forward(self, input):
         return F.normalize(input, p=2, dim=self.dim)
+
 
 if __name__ == "__main__":
     opt = parser.parse_args()
@@ -410,6 +462,7 @@ if __name__ == "__main__":
     encoder = nn.Sequential(*layers)
     model = nn.Module() 
     model.add_module('encoder', encoder)
+    print("encode with ", opt.arch.lower())
 
     if opt.mode.lower() != 'cluster':
         if opt.pooling.lower() == 'netvlad':
@@ -429,7 +482,7 @@ if __name__ == "__main__":
                     net_vlad.init_params(clsts, traindescs) 
                     del clsts, traindescs
 
-            model.add_module('pool', net_vlad)
+            model.add_module('pool', net_vlad)            
         elif opt.pooling.lower() == 'max':
             global_pool = nn.AdaptiveMaxPool2d((1,1))
             model.add_module('pool', nn.Sequential(*[global_pool, Flatten(), L2Norm()]))
@@ -438,6 +491,7 @@ if __name__ == "__main__":
             model.add_module('pool', nn.Sequential(*[global_pool, Flatten(), L2Norm()]))
         else:
             raise ValueError('Unknown pooling type: ' + opt.pooling)
+        print('pooling with ', opt.pooling.lower())
 
     isParallel = False
     if opt.nGPU > 1 and torch.cuda.device_count() > 1:
@@ -448,6 +502,13 @@ if __name__ == "__main__":
 
     if not opt.resume:
         model = model.to(device)
+    print(model)
+    print('=====> modules with reset() function')
+    reset_modules = []
+    for m in model.modules():
+        if hasattr(m, 'reset'):
+            print(m)
+            reset_modules.append(m)
     
     if opt.mode.lower() == 'train':
         if opt.optim.upper() == 'ADAM':
@@ -462,6 +523,7 @@ if __name__ == "__main__":
             scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=opt.lrStep, gamma=opt.lrGamma)
         else:
             raise ValueError('Unknown optimizer: ' + opt.optim)
+        print('optimize with ', opt.optim.upper())
 
         # original paper/code doesn't sqrt() the distances, we do, so sqrt() the margin, I think :D
         criterion = nn.TripletMarginLoss(margin=opt.margin**0.5, 
@@ -495,9 +557,8 @@ if __name__ == "__main__":
         print('===> Calculating descriptors and clusters')
         get_clusters(whole_train_set)
     elif opt.mode.lower() == 'train':
-        print('===> Training model')
-        if opt.save:
-            writer = SummaryWriter(log_dir=join(opt.runsPath, datetime.now().strftime('%b%d_%H-%M-%S')+'_'+opt.arch+'_'+opt.pooling))
+        print('===> Training model')        
+        writer = SummaryWriter(log_dir=join(opt.runsPath, datetime.now().strftime('%b%d_%H-%M-%S')+'_'+opt.arch+'_'+opt.pooling))
 
         # write checkpoints in logdir
         logdir = writer.file_writer.get_logdir()
@@ -505,6 +566,7 @@ if __name__ == "__main__":
         if not opt.resume:
             makedirs(opt.savePath)
 
+        
         with open(join(opt.savePath, 'flags.json'), 'w') as f:
             f.write(json.dumps(
                 {k:v for k,v in vars(opt).items()}
@@ -528,15 +590,15 @@ if __name__ == "__main__":
                 else: 
                     not_improved += 1
                 
-                if opt.save:
-                    save_checkpoint({
-                            'epoch': epoch,
-                            'state_dict': model.state_dict(),
-                            'recalls': recalls,
-                            'best_score': best_score,
-                            'optimizer' : optimizer.state_dict(),
-                            'parallel' : isParallel,
-                    }, is_best)
+                
+                save_checkpoint({
+                        'epoch': epoch,
+                        'state_dict': model.state_dict(),
+                        'recalls': recalls,
+                        'best_score': best_score,
+                        'optimizer' : optimizer.state_dict(),
+                        'parallel' : isParallel,
+                }, is_best)
 
                 if opt.patience > 0 and not_improved > (opt.patience / opt.evalEvery):
                     print('Performance did not improve for', opt.patience, 'epochs. Stopping.')
@@ -545,3 +607,7 @@ if __name__ == "__main__":
                 scheduler.step(epoch)
         print("=> Best Recall@5: {:.4f}".format(best_score), flush=True)
         writer.close()
+
+    if not opt.save:
+        print('remove '+logdir)
+        os.system("rm -rf "+logdir)
